@@ -36,7 +36,7 @@ class HopperFlatCfg() :
     class env():
         num_envs = 4096
         # history_length=1 means only using current observation
-        history_length = 12
+        history_length = 5
         num_observations = (3+3+3+2+4+3)*history_length
         num_privileged_obs = None # if not None a priviledge_obs_buf will be returned by step() (critic obs for assymetric training). None is returned otherwise 
         num_actions = NUM_JOINT
