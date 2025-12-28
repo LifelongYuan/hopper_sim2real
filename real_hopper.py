@@ -38,7 +38,7 @@ from real_hopper_osc_multi import *
 from real_hopper_torch_utils import *
 from real_hopper_gym_utils import *
 from hopper_config import *
-from udp_interface import udp_interface
+import lcm_interface
 from scipy.spatial.transform import Rotation as R
 from util.utilities import *
 HACK_ACTION_SCALE = False
@@ -107,17 +107,14 @@ class RealHopper():
         self._init_ref_motion()
         self.time_per_render = self.cfg.sim.dt * self.cfg.control.decimation
         # self._ref_motion = refmotion()
-        # self._lcm_interface = lcm_interface.cheetah_lcm()
-        self._udp_interface =  udp_interface(50,500,1,
-                        send_IP="169.254.24.118",
-                        send_port=25000,
-                        recv_IP="169.254.24.157",
-                        recv_port=25001)
-        # self._udp_interface =  udp_interface(50,600,1,
-        #                 send_IP="127.0.0.1",
-        #                 send_port=25000,
-        #                 recv_IP="127.0.0.1",
-        #                 recv_port=25001)
+        self._lcm_interface = lcm_interface.robot_lcm(
+            publish_freq=50,
+            ttl=1,
+            pub_topic_name="hopper_cmd",
+            sub_topic_name_dict={"data":"hopper_data",
+                                "imu":"hopper_imu",
+                                "gamepad":"gamepad"},
+            joint_state_ros_pub=False)
         # self._gameped_interface = lcm_interface.gamepad_lcm()
         env_ids =torch.ones([self.num_envs]).bool().nonzero(as_tuple=False).flatten()
         # first receive observation before reset ref motion.
@@ -164,10 +161,8 @@ class RealHopper():
             return
         
     def _init_thread(self):
-        # self._lcm_interface.start_sending()
-        # self._lcm_interface.start_recving()
-        self._udp_interface.start_sending()
-        self._udp_interface.start_recving()
+        self._lcm_interface.start_sending()
+        self._lcm_interface.start_recving()
         # self._gameped_interface.start_recving()
         self.main_thread_locker = threading.Lock()
 
@@ -213,13 +208,23 @@ class RealHopper():
         kp = 10.0
         kd = 0.2
         print(foot_pos)
-        self._udp_interface.action = np.concatenate((foot_pos,[kp],[kd]))
-
+        
+        # Set LCM command message
+        # full_action is already in joint space, so use it directly for q_des
         if self.unsafe_flag==False:
-            self._udp_interface.action = np.concatenate((foot_pos,[kp],[kd]))
+            self._lcm_interface.c2r_cmd_msg.q_des = list(full_action[0].cpu().numpy())
+            self._lcm_interface.c2r_cmd_msg.qd_des = [0.0, 0.0, 0.0]  # zero desired velocity
+            self._lcm_interface.c2r_cmd_msg.kp_joint = [kp, kp, kp]
+            self._lcm_interface.c2r_cmd_msg.kd_joint = [kd, kd, kd]
+            self._lcm_interface.c2r_cmd_msg.tau_ff = [0.0, 0.0, 0.0]  # zero feedforward torque
         else:
             print("shut down!!")
-            self._udp_interface.action = np.concatenate((full_action[0],[0],[kd]))
+            # Send zero gains for safety
+            self._lcm_interface.c2r_cmd_msg.q_des = list(full_action[0].cpu().numpy())
+            self._lcm_interface.c2r_cmd_msg.qd_des = [0.0, 0.0, 0.0]
+            self._lcm_interface.c2r_cmd_msg.kp_joint = [0.0, 0.0, 0.0]
+            self._lcm_interface.c2r_cmd_msg.kd_joint = [kd, kd, kd]
+            self._lcm_interface.c2r_cmd_msg.tau_ff = [0.0, 0.0, 0.0]
         # print("spent:",time.time()-self.s)
         self.main_thread_locker.release()
         # print(self.final_actions[:])
@@ -251,65 +256,54 @@ class RealHopper():
     def decode_observation(self):
         # rpy = np.array(self._lcm_interface.c2p_msg.rpy)
         self._state_flag = 1
-        raw_data = self._udp_interface.last_obs
-        raw_data = [item[0] for item in raw_data]
-        # print("raw_data",raw_data)
-        # joint_pos = raw_data[0:3]
-        # print("joint_pos",joint_pos)
-        foot_pos = raw_data[19:22]
-        # print("ori_foot",foot_pos)
-        # # foot -> real body -> sim body
+        
+        # Get joint positions and velocities directly from LCM hopper_data message
+        joint_pos = np.array(list(self._lcm_interface.r2c_data_msg.q))
+        joint_vel = np.array(list(self._lcm_interface.r2c_data_msg.qd))
+        
+        # Apply CONST_OFFSET to joint position (matching original code behavior)
+        joint_pos[2] += CONST_OFFSET
+        
+        # Compute foot_pos from joint positions for debugging/compatibility
+        joint_pos_for_fk = joint_pos.copy()
+        joint_pos_for_fk[2] -= CONST_OFFSET  # Remove offset for FK computation
+        foot_pos = fk_simplified(joint_pos_for_fk[0], joint_pos_for_fk[1], joint_pos_for_fk[2])
+        
+        # Apply coordinate transformation: foot -> real body -> sim body
         rot = R.from_matrix(realbody2simbody()*foot2body())
-        foot_pos=  rot.apply(foot_pos)
-        # print("foot_sim_frame",foot_pos)
+        foot_pos = rot.apply(foot_pos)
+        
+        # Verify joint_pos is valid (check for NaN)
+        if np.sum(np.isnan(joint_pos)) != 0:
+            print("NaN detected in joint_pos from LCM, resetting to zero")
+            joint_pos = np.array([0.0, 0.0, 0.0])
 
-        joint_pos = ik_simplified(foot_pos)
-        # print("foot_pos",foot_pos)
-        joint_pos[2] +=CONST_OFFSET
-        # print("received_foot_pos",foot_pos)
-        # print("received_joint_pos",joint_pos) # [0 to 0.19]
-        if np.sum(np.isnan(joint_pos)) !=0:
-            print("ik singularity foot pos: ",foot_pos)
-            joint_pos = [0,0,0]
-
-        # print("joint_sim",joint_pos)
-        # ori_raw_imu = raw_data[6:10]  # wxyz
-        ori_raw_imu = raw_data[25:29]
-        if ori_raw_imu == []:
-            ori_raw_imu = [1,0,0,0]
-        # print("ori_raw_imu",ori_raw_imu)
-        # print("ori",ori)
-
-        q_raw_imu = R.from_quat([ori_raw_imu[1],ori_raw_imu[2],ori_raw_imu[3],ori_raw_imu[0]])
-        # print("ori_raw_imu",ori_raw_imu)
-        imu_raw_to_body =  R.from_euler('z', 0)*R.from_euler('x', 1.57)
-        rotated_quaternion = (imu_raw_to_body*q_raw_imu).as_quat()
-        quat = [rotated_quaternion[0],rotated_quaternion[1],rotated_quaternion[2],rotated_quaternion[3]]
-        q_imu_raw = to_torch(quat,device=self.device).unsqueeze(dim=0)
-        r,p,y=get_euler_xyz(q_imu_raw)
+        # Get IMU data from LCM hopper_imu message
+        # LCM quat format: [w, x, y, z] or [x, y, z, w] - need to check
+        # Based on the code, it seems the original format was wxyz, so assuming LCM is [w, x, y, z]
+        ori_raw_imu = list(self._lcm_interface.r2c_imu_msg.quat)
+        if len(ori_raw_imu) == 0 or all(x == 0 for x in ori_raw_imu):
+            ori_raw_imu = [1, 0, 0, 0]
+        
+        # Convert from LCM quat format (assuming [w, x, y, z]) to scipy format [x, y, z, w]
+        q_raw_imu = R.from_quat([ori_raw_imu[1], ori_raw_imu[2], ori_raw_imu[3], ori_raw_imu[0]])
+        imu_raw_to_body = R.from_euler('z', 0) * R.from_euler('x', 1.57)
+        rotated_quaternion = (imu_raw_to_body * q_raw_imu).as_quat()
+        quat = [rotated_quaternion[0], rotated_quaternion[1], rotated_quaternion[2], rotated_quaternion[3]]
+        q_imu_raw = to_torch(quat, device=self.device).unsqueeze(dim=0)
+        r, p, y = get_euler_xyz(q_imu_raw)
         temp = r
         r = -p
-        p = temp*0
-        # r-=0.03
-        # r-=0.05
-        # y*=0
-        # y+=-0.57
-        # r+=0.05
+        p = temp * 0
 
+        # if self.common_step_counter > 50:
+        #     self.roll_pitch_safety_check(r, p)
+        print("roll_raw", normalize_angle(r))
+        print("pitch_raw", normalize_angle(p))
+        print("y_raw", normalize_angle(y))
 
-        # if self.common_step_counter >50:
-        #     self.roll_pitch_safety_check(r,p)
-        print("roll_raw",normalize_angle(r))
-        print("pitch_raw",normalize_angle(p))
-        print("y_raw",normalize_angle(y))
-        # rot = R.from_euler('z', 3.14)
-
-        # Rotate the original quaternion
-        # q =  R.from_quat([ori[1],ori[2],ori[3],ori[0]])
-        # rotated_quaternion = (q).as_quat()
-        # quat = [rotated_quaternion[0],rotated_quaternion[1],rotated_quaternion[2],rotated_quaternion[3]]
-
-        ang_vel = raw_data[13:16]
+        # Get angular velocity from LCM IMU message
+        ang_vel = np.array(list(self._lcm_interface.r2c_imu_msg.gyro))
         rot = R.from_matrix(realbody2simbody())
         ang_vel = rot.apply(ang_vel)
         # print("ang_vel",ang_vel)
@@ -369,8 +363,9 @@ class RealHopper():
     def _tweak_motor_order_direction(self):
         # isaac order:  LF LH RF RH     abduction +hip+ knee
         # cheetah software order: FR FL HR HL adduction + hip + knee
-        raw_angles = np.array(self._udp_interface.pstate.contents.motor_pos)*self.motor_direction_correction
-        raw_vels = np.array(self._udp_interface.pstate.contents.motor_vel)*self.motor_direction_correction
+        # Get joint positions and velocities from LCM
+        raw_angles = np.array(list(self._lcm_interface.r2c_data_msg.q)) * self.motor_direction_correction
+        raw_vels = np.array(list(self._lcm_interface.r2c_data_msg.qd)) * self.motor_direction_correction
         # print(raw_angles)
         self._recv_motor_angles[0:3] = raw_angles[3:6]
         self._recv_motor_angles[3:6] = raw_angles[0:3]
