@@ -1,8 +1,8 @@
 import lcm
-from hopper_lcm_types.python.hopper_data_lcmt import *
-from hopper_lcm_types.python.hopper_cmd_lcmt import *
-from hopper_lcm_types.python.gamepad_lcmt import *
-from hopper_lcm_types.python.hopper_imu_lcmt import *
+from hopper_lcm_types.lcm_types.python.hopper_data_lcmt import *
+from hopper_lcm_types.lcm_types.python.hopper_cmd_lcmt import *
+from hopper_lcm_types.lcm_types.python.gamepad_lcmt import *
+from hopper_lcm_types.lcm_types.python.hopper_imu_lcmt import *
 import threading
 from threading import Timer
 import time
