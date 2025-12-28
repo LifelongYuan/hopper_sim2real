@@ -50,7 +50,7 @@ class robot_lcm:
         # TODO: two thread is enough?
         self.lcm_sender_thread = threading.Thread(target=self.thread_1)
         self.lcm_receiver_thread = threading.Thread(target=self.thread_2)
-        self.s=time.time()
+        self.next_publish_time = time.perf_counter()
 
         if joint_state_ros_pub and not ON_BOARD:
  
@@ -91,11 +91,20 @@ class robot_lcm:
         self.lcm_receiver_thread.start()
 
     def thread_1(self):
+        period = 1.0 / self.pub_freq
         while 1:
+            # Publish the message
             self.publish()
-            elapsed_time = time.time() - self.s
-            time.sleep(max(0, 1/self.pub_freq - elapsed_time))
-            self.s = time.time()
+            # Calculate next wake time
+            self.next_publish_time += period
+            # Sleep until next wake time (drift-free approach)
+            sleep_time = self.next_publish_time - time.perf_counter()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                # If we're behind schedule, don't sleep but update next time
+                # to prevent accumulating drift
+                self.next_publish_time = time.perf_counter() + period
 
     def thread_2(self):
         while 1:
